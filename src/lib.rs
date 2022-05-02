@@ -3,13 +3,17 @@ use std::sync::mpsc; // multiple producer, single consumer
 use std::sync::Arc;
 use std::sync::Mutex;
 
-pub struct ThreadPool {
-    workers: Vec<Worker>, // dont need closures to return anything
-    sender: mpsc::Sender<Job>
-}
 
 // alias trait object containing a one use closure to Job
 type Job = Box<dyn FnOnce() + Send + 'static>;
+enum Message {
+    NewJob(Job),
+    Terminate
+}
+pub struct ThreadPool {
+    workers: Vec<Worker>, // dont need closures to return anything
+    sender: mpsc::Sender<Message>
+}
 
 impl ThreadPool {
     /// Create a new ThreadPool
@@ -44,26 +48,58 @@ impl ThreadPool {
     {
         let job = Box::new(f); // create a Job instance (our alias)
 
-        self.sender.send(job).unwrap(); // send that job down the channel
+        self.sender.send(Message::NewJob(job)).unwrap(); // send that job down the channel
     }
 }
 
+// call join on all the worker threads when shutting down / dropping a threadpool
+// note to self: join takes ownership so cant be working with references.
+impl Drop for ThreadPool {
+    fn drop(&mut self) {
+        println!("Sending terminate message to all workers.");
+
+        for _ in &self.workers {
+            // they stop their infinite loops if they receive this.
+            // otherwise the loop would continue and join would wait for it to finish (it never would)
+            self.sender.send(Message::Terminate).unwrap();
+        }
+
+        println!("Shutting down all workers.");
+
+        // call join in a second loop to prevent deadlocks, aka once every worker
+        // has already received the terminate message.
+        for worker in &mut self.workers {
+            println!("Shutting down worker: {}", worker.id);
+            // use take to take ownership of Option<thread::JoinHandle<()>> and change variant to None.
+            if let Some(thread) = worker.thread.take() {
+                thread.join().unwrap();
+            }
+        }
+    }
+}
 struct Worker {
     id: usize,
-    thread: thread::JoinHandle<()>
+    thread: Option<thread::JoinHandle<()>>
 }
 
 impl Worker {
-    fn new(id: usize, receiver: Arc<Mutex<mpsc::Receiver<Job>>>) -> Worker {
+    fn new(id: usize, receiver: Arc<Mutex<mpsc::Receiver<Message>>>) -> Worker {
         // loop forever constantly ask the receiving end of the channel for a job and running it when it gets one
         let thread = thread::spawn(move || loop {
-            let job = receiver.lock()
-                .expect("Poisoned state, another thread panicked.")
-                .recv() // sleep thread until a job becomes available. Mutex ensures only 1 thread at a time receives a job
-                .unwrap();
-            println!("Worker {} got a job; executing.", id);
-            job(); // execute closure / job
+            let message = receiver.lock().unwrap().recv().unwrap();
+
+            match message {
+                Message::NewJob(job) => {
+                    println!("Worker {} got a job; executing.", id);
+                    job();
+                },
+                Message::Terminate => {
+                    println!("Worker {} was told to terminate. Terminating.", id);
+                    break;
+                }
+            }
+
         });
-        Worker { id, thread }
+        Worker { id, thread: Some(thread) }
     }
 }
